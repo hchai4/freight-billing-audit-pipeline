@@ -4,6 +4,14 @@
 
 Freight-audit system that cross-examines warehouse scale scans, UPS EDI 210 invoices, and unstructured portal/email PDFs. Overcharges are quantified in PostgreSQL by dbt, then surfaced in a Streamlit HITL workflow that drafts carrier dispute letters.
 
+**Live demo:** [Logistics Billing Anomaly Agent](https://logistics-billing-anomaly-agent-rkngeowwvh6lkeep9gszt4.streamlit.app)
+
+Invoice Ingestion and Defense Gate:
+<img width="1728" height="860" alt="Screenshot 2026-11-16 at 5 39 05 PM" src="https://github.com/user-attachments/assets/2f686ba4-9408-45ef-af81-9f37b3599788" />
+
+3-Way Reconciliation Mart:
+<img width="1726" height="958" alt="Screenshot 2026-11-16 at 5 53 53 PM" src="https://github.com/user-attachments/assets/a07c5829-5b0a-43ae-8079-f429b249c97d" />
+
 ## Quick start
 
 Needs Docker Desktop and an OpenAI key (Tab 1 extract only).
@@ -43,6 +51,31 @@ curl -s http://127.0.0.1:8000/health
 | Tab 2 | SQL error until `billing_warehouse` has built the mart and the anomaly detector has written the audit table |
 
 Stop the stack with `docker compose down`. The `pgdata` volume stays.
+
+## Public demo (Streamlit Community Cloud)
+
+The UI runs without Postgres, FastAPI, or Airflow in **demo mode**, which is on whenever `DATABASE_URL` is unset (or `DEMO_MODE=true`). A local `.env` copied from `.env.example` sets `DATABASE_URL`, so local runs keep using the warehouse.
+
+| Surface | Demo mode |
+|---|---|
+| Tab 1 | Live extraction with the deployment's OpenAI key. "Save & Ingest" is disabled. |
+| Tab 2 | `data/demo/reconciliation_mart.csv`, exported from the real dbt mart, with scan dates rebased so the filing windows stay current. Filed disputes live in the visitor's session only. |
+| AI calls | Metered by `src/demo/usage_guard.py`: 5 per browser session, 20 per client IP, 150 for all visitors per UTC day, 5 s apart, invoice text up to 6,000 characters. Uploads are capped at 2 MB. |
+
+Deploy:
+
+1. Push the branch to GitHub.
+2. At [share.streamlit.io](https://share.streamlit.io), create an app from this repo with main file `app/app.py` and Python 3.12.
+3. Paste `.streamlit/secrets.toml.example` into **Advanced settings → Secrets** with a real `OPENAI_API_KEY`. The limits can be overridden there too.
+
+The key exists only in Streamlit's secret store and the server process. It is never sent to the browser, and demo mode replaces exception text with a generic message. The in-app counters are held in memory and reset when the app restarts, so treat them as a courtesy limit: create the key in a dedicated OpenAI project with a monthly budget limit, which is the ceiling that holds regardless.
+
+Refresh the snapshot after rebuilding the mart locally:
+
+```bash
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/logistics_db \
+  python data/export_demo_snapshot.py
+```
 
 ## Architecture
 
@@ -263,31 +296,6 @@ Apply `docker/init.sql` if the schemas are missing, then:
 ```bash
 python -m src.api.main          # http://127.0.0.1:8000
 streamlit run app/app.py        # http://localhost:8501
-```
-
-## Public demo (Streamlit Community Cloud)
-
-The UI runs without Postgres, FastAPI, or Airflow in **demo mode**, which is on whenever `DATABASE_URL` is unset (or `DEMO_MODE=true`). A local `.env` copied from `.env.example` sets `DATABASE_URL`, so local runs keep using the warehouse.
-
-| Surface | Demo mode |
-|---|---|
-| Tab 1 | Live extraction with the deployment's OpenAI key. "Save & Ingest" is disabled. |
-| Tab 2 | `data/demo/reconciliation_mart.csv`, exported from the real dbt mart, with scan dates rebased so the filing windows stay current. Filed disputes live in the visitor's session only. |
-| AI calls | Metered by `src/demo/usage_guard.py`: 5 per browser session, 20 per client IP, 150 for all visitors per UTC day, 5 s apart, invoice text up to 6,000 characters. Uploads are capped at 2 MB. |
-
-Deploy:
-
-1. Push the branch to GitHub.
-2. At [share.streamlit.io](https://share.streamlit.io), create an app from this repo with main file `app/app.py` and Python 3.12.
-3. Paste `.streamlit/secrets.toml.example` into **Advanced settings → Secrets** with a real `OPENAI_API_KEY`. The limits can be overridden there too.
-
-The key exists only in Streamlit's secret store and the server process. It is never sent to the browser, and demo mode replaces exception text with a generic message. The in-app counters are held in memory and reset when the app restarts, so treat them as a courtesy limit: create the key in a dedicated OpenAI project with a monthly budget limit, which is the ceiling that holds regardless.
-
-Refresh the snapshot after rebuilding the mart locally:
-
-```bash
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/logistics_db \
-  python data/export_demo_snapshot.py
 ```
 
 ## Tests
