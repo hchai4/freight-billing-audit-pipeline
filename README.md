@@ -4,11 +4,11 @@
 
 Freight-audit system that cross-examines warehouse scale scans, UPS EDI 210 invoices, and unstructured portal/email PDFs. Overcharges are quantified in PostgreSQL by dbt, then surfaced in a Streamlit HITL workflow that drafts carrier dispute letters.
 
-3-Way Reconciliation Mart:
-<img width="1728" height="937" alt="Screenshot 2026-11-16 at 5 39 29 PM" src="https://github.com/user-attachments/assets/35f5ae00-cf4b-416c-9672-4a043a98180c" />
-
 Invoice Ingestion and Defense Gate:
 <img width="1728" height="860" alt="Screenshot 2026-11-16 at 5 39 05 PM" src="https://github.com/user-attachments/assets/2f686ba4-9408-45ef-af81-9f37b3599788" />
+
+3-Way Reconciliation Mart:
+<img width="1726" height="958" alt="Screenshot 2026-11-16 at 5 53 53 PM" src="https://github.com/user-attachments/assets/a07c5829-5b0a-43ae-8079-f429b249c97d" />
 
 **Live demo:** [Logistics Billing Anomaly Agent](https://logistics-billing-anomaly-agent-rkngeowwvh6lkeep9gszt4.streamlit.app)
 
