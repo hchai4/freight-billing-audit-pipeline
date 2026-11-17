@@ -1,5 +1,8 @@
+import hashlib
+import logging
 import os
 import sys
+import uuid
 from datetime import timedelta
 from pathlib import Path
 
@@ -12,18 +15,7 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
-from src.agent.llm_agent import InvoiceExtractionAgent
-from src.utils.pdf_extractor import extract_text_from_pdf
-from src.privacy.pii_masker import PIIMasker
-from src.db.db_writer import insert_extracted_invoice
-from src.agent.dispute_agent import DisputeAgent, DisputeRequest
-
-load_dotenv()
-
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/logistics_db"
-)
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------
 # Page Configuration
@@ -33,6 +25,77 @@ st.set_page_config(
     page_icon="📦",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+# ---------------------------------------------------------
+# Configuration & Secrets
+# ---------------------------------------------------------
+load_dotenv()
+
+# Streamlit Community Cloud supplies configuration through st.secrets, while the
+# agents read os.environ at import time. Copy the keys across before importing
+# them; values are never rendered or logged.
+CONFIG_KEYS = (
+    "OPENAI_API_KEY",
+    "DATABASE_URL",
+    "API_BASE_URL",
+    "DEMO_MODE",
+    "DEMO_SESSION_DAILY_LIMIT",
+    "DEMO_IP_DAILY_LIMIT",
+    "DEMO_GLOBAL_DAILY_LIMIT",
+    "DEMO_MAX_INPUT_CHARS",
+)
+try:
+    for _key in CONFIG_KEYS:
+        if _key in st.secrets and not os.getenv(_key):
+            os.environ[_key] = str(st.secrets[_key])
+except Exception:
+    # No secrets file (local runs configured through .env).
+    pass
+
+_openai_key = os.getenv("OPENAI_API_KEY", "")
+if not _openai_key or _openai_key.startswith("your_"):
+    st.error(
+        "OPENAI_API_KEY is not configured. Set it in `.env` for local runs or in "
+        "the app's Secrets on Streamlit Community Cloud."
+    )
+    st.stop()
+
+from src.agent.llm_agent import InvoiceExtractionAgent
+from src.utils.pdf_extractor import extract_text_from_pdf
+from src.privacy.pii_masker import PIIMasker
+from src.db.db_writer import insert_extracted_invoice
+from src.db.mart_reader import load_mart_from_db, load_mart_snapshot
+from src.agent.dispute_agent import DisputeAgent, DisputeRequest
+from src.demo.usage_guard import UsageGuard, UsageLimits
+
+# Demo mode serves a bundled mart snapshot, keeps writes in the visitor's own
+# session, and meters AI calls. It is the default whenever no warehouse is
+# configured, so a hosted deployment is rate-limited unless it opts out.
+_demo_flag = os.getenv("DEMO_MODE", "").strip().lower()
+if _demo_flag:
+    DEMO_MODE = _demo_flag in ("1", "true", "yes", "on")
+else:
+    DEMO_MODE = not os.getenv("DATABASE_URL")
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/logistics_db"
+)
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except ValueError:
+        return default
+
+
+USAGE_LIMITS = UsageLimits(
+    session_daily=_env_int("DEMO_SESSION_DAILY_LIMIT", UsageLimits.session_daily),
+    ip_daily=_env_int("DEMO_IP_DAILY_LIMIT", UsageLimits.ip_daily),
+    global_daily=_env_int("DEMO_GLOBAL_DAILY_LIMIT", UsageLimits.global_daily),
+    max_input_chars=_env_int("DEMO_MAX_INPUT_CHARS", UsageLimits.max_input_chars),
 )
 
 # ---------------------------------------------------------
@@ -105,42 +168,55 @@ AUDIT_COLUMNS = (
 )
 
 
+@st.cache_resource
+def get_usage_guard() -> UsageGuard:
+    """One guard per server process, shared by every visitor."""
+    return UsageGuard(USAGE_LIMITS)
+
+
+def _visitor_keys() -> tuple:
+    """Session id plus a hashed client IP (None when the IP is unavailable)."""
+    if "demo_session_id" not in st.session_state:
+        st.session_state["demo_session_id"] = uuid.uuid4().hex
+    ip = None
+    try:
+        forwarded = st.context.headers.get("X-Forwarded-For")
+        ip = forwarded.split(",")[0].strip() if forwarded else st.context.ip_address
+    except Exception:
+        pass
+    ip_key = hashlib.sha256(ip.encode()).hexdigest()[:16] if ip else None
+    return st.session_state["demo_session_id"], ip_key
+
+
+def reserve_ai_call() -> bool:
+    """Charges one AI call against the visitor's demo quota, warning if refused."""
+    if not DEMO_MODE:
+        return True
+    refusal = get_usage_guard().try_acquire(*_visitor_keys())
+    if refusal:
+        st.warning(f"⏳ {refusal}")
+        return False
+    return True
+
+
 def load_reconciliation_mart() -> pd.DataFrame:
-    """Queries fct_reconciliation_marts joined with exception audit statuses."""
-    query = """
-    SELECT
-        m.tracking_id,
-        m.package_id,
-        m.primary_invoice_number AS invoice_number,
-        m.carrier_code AS carrier_name,
-        m.primary_source_channel AS source_channel,
-        m.scan_timestamp,
-        m.actual_scale_weight_lbs AS actual_scale_weight,
-        m.billed_weight_lbs AS billed_weight,
-        m.weight_variance_lbs,
-        m.expected_total_cost_usd AS expected_total_cost,
-        -- All-lines total, not billed_total_usd: only this reconciles as
-        -- billed - expected = total_variance_usd on duplicate-billing rows.
-        m.billed_total_all_lines_usd AS billed_total,
-        m.total_variance_usd AS dollar_variance,
-        m.anomaly_codes AS anomaly_classification,
-        COALESCE(m.total_recoverable_usd, 0) > 0 AS is_eligible_for_dispute,
-        CASE WHEN COALESCE(e.has_dispute_sent, FALSE) THEN 'DISPUTE_SENT'
-             ELSE 'PENDING_REVIEW' END AS dispute_status
-    FROM analytics_marts.fct_reconciliation_marts m
-    LEFT JOIN (
-        -- Pre-aggregated so repeated audit rows per tracking_id cannot fan out the mart.
-        SELECT tracking_id, bool_or(dispute_status = 'DISPUTE_SENT') AS has_dispute_sent
-        FROM source_enterprise.audit_flagged_exceptions
-        GROUP BY tracking_id
-    ) e ON m.tracking_id = e.tracking_id
-    ORDER BY dollar_variance DESC;
-    """
-    return pd.read_sql(query, con=get_engine())
+    """Loads the reconciliation mart with dispute statuses applied."""
+    if not DEMO_MODE:
+        return load_mart_from_db(get_engine())
+    df = load_mart_snapshot()
+    sent = st.session_state.get("demo_disputes_sent", set())
+    df.loc[df["tracking_id"].isin(sent), "dispute_status"] = "DISPUTE_SENT"
+    return df
 
 
 def update_dispute_status_in_db(row_data: dict):
     """Updates or records dispute status as DISPUTE_SENT in PostgreSQL."""
+    if DEMO_MODE:
+        # Visitors share no warehouse: a filed dispute lives in their session only.
+        st.session_state.setdefault("demo_disputes_sent", set()).add(
+            str(row_data["tracking_id"])
+        )
+        return
     update_sql = text(
         """
     UPDATE source_enterprise.audit_flagged_exceptions
@@ -175,22 +251,31 @@ def update_dispute_status_in_db(row_data: dict):
 with st.sidebar:
     st.header("⚙️ System Status")
 
-    try:
-        with get_engine().connect() as conn:
-            conn.execute(text("SELECT 1"))
-        st.success("🟢 PostgreSQL: Connected")
-    except Exception:
-        st.error("🔴 PostgreSQL: Unreachable")
+    # Filled at the end of the run so it reflects calls made during this run.
+    quota_slot = st.empty()
 
-    # Check FastAPI Backend Health
-    try:
-        health_resp = requests.get(f"{API_BASE_URL}/health", timeout=1.0)
-        if health_resp.status_code == 200:
-            st.success("🟢 FastAPI Backend: Online")
-        else:
-            st.warning("🟡 FastAPI Backend: Degraded")
-    except Exception:
-        st.info("ℹ️ FastAPI Backend: Offline (Using Local Fallback)")
+    if DEMO_MODE:
+        st.info(
+            "🧪 **Public demo.** Tab 2 shows a snapshot exported from the dbt "
+            "mart, and disputes you file stay in your own browser session."
+        )
+    else:
+        try:
+            with get_engine().connect() as conn:
+                conn.execute(text("SELECT 1"))
+            st.success("🟢 PostgreSQL: Connected")
+        except Exception:
+            st.error("🔴 PostgreSQL: Unreachable")
+
+        # Check FastAPI Backend Health
+        try:
+            health_resp = requests.get(f"{API_BASE_URL}/health", timeout=1.0)
+            if health_resp.status_code == 200:
+                st.success("🟢 FastAPI Backend: Online")
+            else:
+                st.warning("🟡 FastAPI Backend: Degraded")
+        except Exception:
+            st.info("ℹ️ FastAPI Backend: Offline (Using Local Fallback)")
 
     st.divider()
     st.markdown("**Enterprise Architecture Stack:**")
@@ -270,7 +355,13 @@ with tab_ingestion:
     ):
         if invoice_text is None or not invoice_text.strip():
             st.warning("⚠️ Please provide invoice text to analyze.")
-        else:
+        elif DEMO_MODE and len(invoice_text) > USAGE_LIMITS.max_input_chars:
+            st.warning(
+                f"⚠️ The demo accepts invoices up to "
+                f"{USAGE_LIMITS.max_input_chars:,} characters "
+                f"(this one is {len(invoice_text):,})."
+            )
+        elif reserve_ai_call():
             with st.spinner(
                 "Extracting Pydantic Schema & Running Deterministic Math Verification..."
             ):
@@ -282,7 +373,16 @@ with tab_ingestion:
                     st.session_state["latest_math_report"] = math_report
                     st.session_state["latest_pii_stats"] = pii_stats
                 except Exception as e:
-                    st.error(f"Extraction failed: {str(e)}")
+                    if DEMO_MODE:
+                        # Provider errors can echo request details; keep them in
+                        # the server log rather than on a public page.
+                        logger.exception("Invoice extraction failed")
+                        st.error(
+                            "Extraction failed. Check that the text is a carrier "
+                            "invoice, or load one of the samples above."
+                        )
+                    else:
+                        st.error(f"Extraction failed: {str(e)}")
 
     # Render extraction results if available
     if "latest_extraction" in st.session_state:
@@ -345,6 +445,12 @@ with tab_ingestion:
                 "📥 Save & Ingest to Database",
                 type="secondary",
                 use_container_width=True,
+                disabled=DEMO_MODE,
+                help=(
+                    "Disabled in the public demo, which has no warehouse to write to."
+                    if DEMO_MODE
+                    else None
+                ),
             ):
                 try:
                     rows_inserted = insert_extracted_invoice(
@@ -815,8 +921,12 @@ with tab_reconciliation:
 
                     # Action: Generate AI Dispute Letter
                     st.write("")
-                    if st.button(
-                        "📝 Generate Individual Formal Dispute Letter", type="primary"
+                    if (
+                        st.button(
+                            "📝 Generate Individual Formal Dispute Letter",
+                            type="primary",
+                        )
+                        and reserve_ai_call()
                     ):
                         with st.spinner(
                             "Calling AI Dispute Agent to compile evidence-backed claim letter..."
@@ -840,6 +950,9 @@ with tab_reconciliation:
 
                             dispute_letter_text = ""
                             try:
+                                if DEMO_MODE:
+                                    # The hosted demo runs no FastAPI service.
+                                    raise RuntimeError("in-process only")
                                 # 1. Attempt calling the live FastAPI REST endpoint
                                 resp = requests.post(
                                     f"{API_BASE_URL}/api/generate-dispute",
@@ -909,7 +1022,20 @@ with tab_reconciliation:
                             )
 
     except Exception as e:
-        st.error(f"Failed to load reconciliation mart: {e}")
-        st.info(
-            "💡 Ensure PostgreSQL is running on port 5432 and you have executed `dbt run` to build `analytics_marts.fct_reconciliation_marts`."
-        )
+        if DEMO_MODE:
+            logger.exception("Audit tab failed")
+            st.error("Something went wrong in the audit tab. Please try again.")
+        else:
+            st.error(f"Failed to load reconciliation mart: {e}")
+            st.info(
+                "💡 Ensure PostgreSQL is running on port 5432 and you have executed `dbt run` to build `analytics_marts.fct_reconciliation_marts`."
+            )
+
+if DEMO_MODE:
+    calls_left = get_usage_guard().remaining(*_visitor_keys())
+    quota_slot.metric(
+        "AI calls left today",
+        f"{calls_left} / {USAGE_LIMITS.session_daily}",
+        help="Each extraction or dispute letter uses one call. Resets at 00:00 UTC.",
+        border=True,
+    )
