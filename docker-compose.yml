@@ -58,7 +58,7 @@ services:
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./:/opt/billing
-      - ../logistics-billing-anomaly-agent-dbt:/opt/dbt
+      - ../freight-billing-audit-pipeline-dbt:/opt/dbt
     ports:
       - "8080:8080"
     depends_on:

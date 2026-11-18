@@ -9,7 +9,7 @@ from src.agent.dispute_agent import DisputeAgent, DisputeRequest, DisputeRespons
 
 # Initialize FastAPI App
 app = FastAPI(
-    title="Logistics Billing Anomaly & AI Agent API",
+    title="Freight Billing Audit API",
     description="Enterprise REST API for PII Masking, Type-Safe LLM Invoice Extraction, Math Verification, and Dispute Generation.",
     version="1.0.0",
 )
@@ -38,7 +38,7 @@ class ExtractResponse(BaseModel):
 @app.get("/health", status_code=status.HTTP_200_OK)
 def health_check():
     """Health check endpoint for API monitoring."""
-    return {"status": "healthy", "service": "Logistics AI Agent API"}
+    return {"status": "healthy", "service": "Freight Billing Audit API"}
 
 
 @app.post(
