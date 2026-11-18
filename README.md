@@ -1,6 +1,6 @@
 # Freight Billing Audit Pipeline
 
-[![CI](https://github.com/hchai4/logistics-billing-anomaly-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/hchai4/logistics-billing-anomaly-agent/actions/workflows/ci.yml)
+[![CI](https://github.com/hchai4/freight-billing-audit-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/hchai4/freight-billing-audit-pipeline/actions/workflows/ci.yml)
 
 Freight-audit system that cross-examines warehouse scale scans, UPS EDI 210 invoices, and unstructured portal/email PDFs. Overcharges are quantified in PostgreSQL by dbt, then surfaced in a Streamlit HITL workflow that drafts carrier dispute letters.
 
@@ -17,7 +17,7 @@ Invoice Ingestion and Defense Gate:
 Needs Docker Desktop and an OpenAI key (Tab 1 extract only).
 
 ```bash
-git clone https://github.com/hchai4/logistics-billing-anomaly-agent.git freight-billing-audit-pipeline
+git clone https://github.com/hchai4/freight-billing-audit-pipeline.git
 cd freight-billing-audit-pipeline
 cp .env.example .env
 # set OPENAI_API_KEY in .env — leave DATABASE_URL as the example
@@ -234,7 +234,7 @@ Airflow runs dbt from the sibling repo, mounted at `/opt/dbt`. Clone that repo n
 
 ```bash
 cd ..
-git clone https://github.com/hchai4/logistics-billing-anomaly-agent-dbt.git freight-billing-audit-pipeline-dbt
+git clone https://github.com/hchai4/freight-billing-audit-pipeline-dbt.git
 ```
 
 The host commands in the next section are the fallback when the Airflow service is not running.
@@ -259,7 +259,7 @@ Clone the sibling dbt repo and build the contract seeds plus the mart. Its profi
 
 ```bash
 cd ..
-git clone https://github.com/hchai4/logistics-billing-anomaly-agent-dbt.git freight-billing-audit-pipeline-dbt
+git clone https://github.com/hchai4/freight-billing-audit-pipeline-dbt.git
 cd freight-billing-audit-pipeline-dbt
 python3 -m venv .venv
 source .venv/bin/activate
