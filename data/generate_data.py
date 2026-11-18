@@ -41,7 +41,7 @@ def get_db_connection():
 def initialize_schemas_and_tables():
     """
     Creates enterprise schemas and raw ingestion tables in PostgreSQL.
-    Column sets match the dbt staging models in logistics-billing-anomaly-agent-dbt.
+    Column sets match the dbt staging models in freight-billing-audit-pipeline-dbt.
     """
     ddl_statements = """
     CREATE SCHEMA IF NOT EXISTS source_enterprise;
