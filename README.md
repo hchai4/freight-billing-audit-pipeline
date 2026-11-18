@@ -1,10 +1,10 @@
-# Logistics Billing Anomaly Agent
+# Freight Billing Audit Pipeline
 
 [![CI](https://github.com/hchai4/logistics-billing-anomaly-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/hchai4/logistics-billing-anomaly-agent/actions/workflows/ci.yml)
 
 Freight-audit system that cross-examines warehouse scale scans, UPS EDI 210 invoices, and unstructured portal/email PDFs. Overcharges are quantified in PostgreSQL by dbt, then surfaced in a Streamlit HITL workflow that drafts carrier dispute letters.
 
-**Live demo:** [Logistics Billing Anomaly Agent](https://logistics-billing-anomaly-agent-rkngeowwvh6lkeep9gszt4.streamlit.app) (see [Public demo](#public-demo-streamlit-community-cloud) for the limits)
+**Live demo:** [Freight Billing Audit Pipeline](https://logistics-billing-anomaly-agent-rkngeowwvh6lkeep9gszt4.streamlit.app) (see [Public demo](#public-demo-streamlit-community-cloud) for the limits)
 
 Invoice Ingestion and Defense Gate:
 <img width="1728" height="860" alt="Screenshot 2026-11-16 at 5 39 05 PM" src="https://github.com/user-attachments/assets/2f686ba4-9408-45ef-af81-9f37b3599788" />
@@ -17,8 +17,8 @@ Invoice Ingestion and Defense Gate:
 Needs Docker Desktop and an OpenAI key (Tab 1 extract only).
 
 ```bash
-git clone https://github.com/hchai4/logistics-billing-anomaly-agent.git
-cd logistics-billing-anomaly-agent
+git clone https://github.com/hchai4/logistics-billing-anomaly-agent.git freight-billing-audit-pipeline
+cd freight-billing-audit-pipeline
 cp .env.example .env
 # set OPENAI_API_KEY in .env — leave DATABASE_URL as the example
 docker compose up -d --build
@@ -39,7 +39,7 @@ Compose starts the API, the UI, Airflow, **and** Postgres, published on host por
 
 ```bash
 curl -s http://127.0.0.1:8000/health
-# {"status":"healthy","service":"Logistics AI Agent API"}
+# {"status":"healthy","service":"Freight Billing Audit API"}
 ```
 
 `docker compose ps`: `postgres` and `api` healthy, `ui` and `airflow` running.
@@ -161,7 +161,7 @@ PostgreSQL isolates landing data from analytical output:
 | `source_enterprise` | Raw landing: WMS scans, EDI lines, portal extractions, accessorial fees, HITL dispute statuses. |
 | `analytics_marts` | dbt-built dimensional models. Regenerated with `dbt run`; never written by the app. |
 
-The dbt project lives in the sibling directory `../logistics-billing-anomaly-agent-dbt` (profile `logistics_billing_audit`). Staging models type and alias each feed onto a common contract. Intermediate models resolve three pillars:
+The dbt project lives in the sibling directory `../freight-billing-audit-pipeline-dbt` (profile `logistics_billing_audit`). Staging models type and alias each feed onto a common contract. Intermediate models resolve three pillars:
 
 1. **Physical** — `int_package_physical_truth`: billable weight = max(scale weight, DIM weight using the *contracted* divisor), zone from the warehouse ZIP pair.
 2. **Contract** — `int_contract_expectations`: rate-card lookup on that independently derived zone and weight, never on the invoice's own claims.
@@ -234,7 +234,7 @@ Airflow runs dbt from the sibling repo, mounted at `/opt/dbt`. Clone that repo n
 
 ```bash
 cd ..
-git clone https://github.com/hchai4/logistics-billing-anomaly-agent-dbt.git
+git clone https://github.com/hchai4/logistics-billing-anomaly-agent-dbt.git freight-billing-audit-pipeline-dbt
 ```
 
 The host commands in the next section are the fallback when the Airflow service is not running.
@@ -259,8 +259,8 @@ Clone the sibling dbt repo and build the contract seeds plus the mart. Its profi
 
 ```bash
 cd ..
-git clone https://github.com/hchai4/logistics-billing-anomaly-agent-dbt.git
-cd logistics-billing-anomaly-agent-dbt
+git clone https://github.com/hchai4/logistics-billing-anomaly-agent-dbt.git freight-billing-audit-pipeline-dbt
+cd freight-billing-audit-pipeline-dbt
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -271,7 +271,7 @@ dbt run
 Back in this repo, write the audit table Tab 2 joins. `dbt run` alone leaves that table missing, and the page still errors:
 
 ```bash
-cd ../logistics-billing-anomaly-agent
+cd ../freight-billing-audit-pipeline
 source venv/bin/activate
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/logistics_db \
   python -m src.analytics.anomaly_detector
