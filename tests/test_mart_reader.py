@@ -24,6 +24,15 @@ APP_COLUMNS = {
     "anomaly_classification",
     "is_eligible_for_dispute",
     "dispute_status",
+    "recoverable_usd",
+    "billable_weight_expected_lbs",
+    "contract_base_rate_usd",
+    "billed_base_rate_usd",
+    "unauthorized_residential_fee_usd",
+    "all_invoice_numbers",
+    "guaranteed_delivery_timestamp",
+    "actual_delivery_timestamp",
+    "gsr_refund_usd",
 }
 
 
@@ -43,3 +52,24 @@ def test_snapshot_dates_are_rebased_inside_the_filing_window():
     age_days = (pd.Timestamp(today) - df["scan_timestamp"].dt.normalize()).dt.days
     assert age_days.min() == DEMO_NEWEST_SCAN_AGE_DAYS
     assert age_days.max() <= 30
+
+
+def test_recoverable_amount_is_present_for_every_eligible_claim():
+    df = load_mart_snapshot()
+    eligible = df[df["is_eligible_for_dispute"]]
+    assert (eligible["recoverable_usd"] > 0).all()
+    # Billed-minus-expected can be negative while money is still owed back.
+    assert (eligible["dollar_variance"] < 0).any()
+
+
+def test_delivery_timestamps_move_with_the_scan_date():
+    today = date(2030, 6, 15)
+    base = load_mart_snapshot(today=today)
+    later = load_mart_snapshot(today=date(2030, 6, 25))
+    shift = later["scan_timestamp"] - base["scan_timestamp"]
+    assert (shift == pd.Timedelta(days=10)).all()
+    sla = base.dropna(subset=["guaranteed_delivery_timestamp"])
+    shifted = later.loc[sla.index, "guaranteed_delivery_timestamp"]
+    assert (
+        shifted - sla["guaranteed_delivery_timestamp"] == pd.Timedelta(days=10)
+    ).all()

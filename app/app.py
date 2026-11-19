@@ -67,6 +67,11 @@ from src.privacy.pii_masker import PIIMasker
 from src.db.db_writer import insert_extracted_invoice
 from src.db.mart_reader import load_mart_from_db, load_mart_snapshot
 from src.agent.dispute_agent import DisputeAgent, DisputeRequest
+from src.agent.dispute_evidence import (
+    build_evidence,
+    evidence_lines,
+    recovery_breakdown,
+)
 from src.demo.usage_guard import UsageGuard, UsageLimits
 
 # Demo mode serves a bundled mart snapshot, keeps writes in the visitor's own
@@ -541,11 +546,14 @@ with tab_reconciliation:
             # -------------------------------------------------
             # Executive KPI banner
             # -------------------------------------------------
-            overcharges = pd.DataFrame(
-                audit_df[audit_df["dollar_variance"] > 0], copy=False
+            # Leakage is what the mart says is recoverable. Billed-minus-expected
+            # is not a claim: a late-delivery refund or an unauthorized fee can
+            # leave it negative while money is still owed back.
+            recoverable = pd.DataFrame(
+                audit_df[audit_df["recoverable_usd"] > 0], copy=False
             )
-            total_leakage = pd.Series(overcharges["dollar_variance"]).sum()
-            overcharge_count = len(overcharges)
+            total_leakage = pd.Series(recoverable["recoverable_usd"]).sum()
+            overcharge_count = len(recoverable)
 
             critical_open = audit_df[
                 (audit_df["is_eligible_for_dispute"])
@@ -557,14 +565,14 @@ with tab_reconciliation:
             disputes_sent = pd.DataFrame(
                 audit_df[audit_df["dispute_status"] == "DISPUTE_SENT"], copy=False
             )
-            claimed_total = pd.Series(disputes_sent["dollar_variance"]).sum()
+            claimed_total = pd.Series(disputes_sent["recoverable_usd"]).sum()
 
             with st.container(horizontal=True):
                 st.metric("Audited shipments", f"{len(audit_df):,}", border=True)
                 st.metric(
                     "Identified leakage",
                     f"${total_leakage:,.2f}",
-                    delta=f"{overcharge_count:,} overcharges",
+                    delta=f"{overcharge_count:,} recoverable claims",
                     delta_color="off",
                     delta_arrow="off",
                     border=True,
@@ -723,7 +731,7 @@ with tab_reconciliation:
                 )
                 high_confidence = pd.DataFrame(
                     eligible_unsent[
-                        eligible_unsent["dollar_variance"] >= HIGH_CONFIDENCE_CLAIM_USD
+                        eligible_unsent["recoverable_usd"] >= HIGH_CONFIDENCE_CLAIM_USD
                     ],
                     copy=True,
                 )
@@ -733,7 +741,7 @@ with tab_reconciliation:
                     portal_columns = {
                         "invoice_number": "Carrier_Invoice_Number",
                         "tracking_id": "Disputed_Tracking_ID",
-                        "dollar_variance": "Claim_Refund_Amount",
+                        "recoverable_usd": "Claim_Refund_Amount",
                         "anomaly_classification": "Dispute_Reason_Code",
                     }
                     portal_batch = eligible_unsent.rename(columns=portal_columns)[
@@ -744,7 +752,6 @@ with tab_reconciliation:
                             "billed_total",
                             "expected_total_cost",
                             "Claim_Refund_Amount",
-                            "weight_variance_lbs",
                             "Dispute_Reason_Code",
                         ]
                     ]
@@ -772,7 +779,7 @@ with tab_reconciliation:
                         for claim in high_confidence.to_dict("records"):
                             try:
                                 update_dispute_status_in_db(claim)
-                                claimed += float(claim["dollar_variance"])
+                                claimed += float(claim["recoverable_usd"])
                             except Exception as exc:
                                 failures.append(f"{claim['tracking_id']}: {exc}")
 
@@ -799,30 +806,32 @@ with tab_reconciliation:
                     "invoice_number",
                     "source_channel",
                     "carrier_name",
-                    "actual_scale_weight",
-                    "billed_weight",
-                    "weight_variance_lbs",
+                    "anomaly_classification",
+                    "recoverable_usd",
                     "expected_total_cost",
                     "billed_total",
                     "dollar_variance",
-                    "anomaly_classification",
                     "aging_urgency",
                     "dispute_status",
                 ]
                 usd = st.column_config.NumberColumn(format="$%.2f")
-                lbs = st.column_config.NumberColumn(format="%.2f")
                 st.dataframe(
                     filtered_df[display_cols],
                     width="stretch",
                     height=300,
                     hide_index=True,
                     column_config={
-                        "actual_scale_weight": lbs,
-                        "billed_weight": lbs,
-                        "weight_variance_lbs": lbs,
+                        "anomaly_classification": "Reason codes",
+                        "recoverable_usd": st.column_config.NumberColumn(
+                            "Recoverable", format="$%.2f"
+                        ),
                         "expected_total_cost": usd,
                         "billed_total": usd,
-                        "dollar_variance": usd,
+                        "dollar_variance": st.column_config.NumberColumn(
+                            "Billed − expected",
+                            format="$%.2f",
+                            help="Not the claim amount. See Recoverable.",
+                        ),
                     },
                 )
 
@@ -858,8 +867,8 @@ with tab_reconciliation:
                         "Select flagged tracking number for review",
                         options=list(disputable_rows),
                         format_func=lambda x: (
-                            f"{x} (Overcharge: +${disputable_rows[x]['dollar_variance']:.2f}"
-                            f" | {disputable_rows[x]['anomaly_classification']})"
+                            f"{x} (Recoverable: ${disputable_rows[x]['recoverable_usd']:.2f}"
+                            f" | {disputable_rows[x]['anomaly_classification'] or 'FUEL SURCHARGE'})"
                         ),
                     )
 
@@ -868,46 +877,58 @@ with tab_reconciliation:
 
                     # Audit Evidence Comparison Card
                     st.markdown("#### 🔍 Audit Evidence Ground Truth")
-                    e_col1, e_col2, e_col3 = st.columns(3)
-                    with e_col1:
-                        st.markdown("**Physical Warehouse Reality (WMS):**")
-                        st.write(
-                            f"- Scale Weight: **{selected_row['actual_scale_weight']} lbs**"
+                    if selected_row["dispute_status"] == "DISPUTE_SENT":
+                        window_text = "Claim already filed"
+                    elif days_left < 0:
+                        window_text = f"Expired {abs(days_left)} days ago"
+                    else:
+                        window_text = f"{days_left} days left"
+
+                    with st.container(horizontal=True):
+                        st.metric(
+                            "Recoverable",
+                            f"${selected_row['recoverable_usd']:,.2f}",
+                            border=True,
                         )
-                        st.write(
-                            f"- Scan Timestamp: `{selected_row['scan_timestamp']}`"
+                        st.metric(
+                            "Carrier billed",
+                            f"${selected_row['billed_total']:,.2f}",
+                            border=True,
                         )
-                        st.write(
-                            f"- Expected Cost: **${selected_row['expected_total_cost']:.2f}**"
+                        st.metric(
+                            "Owed under contract",
+                            f"${selected_row['expected_total_cost']:,.2f}",
+                            border=True,
                         )
-                    with e_col2:
-                        st.markdown("**Carrier Invoiced Reality:**")
-                        st.write(
-                            f"- Billed Weight: **{selected_row['billed_weight']} lbs**"
-                        )
-                        st.write(f"- Source Feed: `{selected_row['source_channel']}`")
-                        st.write(
-                            f"- Billed Amount: **${selected_row['billed_total']:.2f}**"
-                        )
-                    with e_col3:
-                        st.markdown("**Audit Findings & Filing Window:**")
-                        st.write(
-                            f"- Weight Delta: **+{selected_row['weight_variance_lbs']} lbs**"
-                        )
-                        st.write(
-                            f"- Net Overcharge: **+${selected_row['dollar_variance']:.2f}**"
-                        )
-                        st.write(
-                            f"- Current Status: `{selected_row['dispute_status']}`"
-                        )
-                        if selected_row["dispute_status"] == "DISPUTE_SENT":
-                            st.write("- Filing Window: **Claim already filed**")
-                        elif days_left < 0:
-                            st.write(
-                                f"- Filing Window: **Expired {abs(days_left)} days ago**"
+                        st.metric("Filing window", window_text, border=True)
+
+                    # One panel per reason code, each citing its own evidence.
+                    for block in build_evidence(selected_row):
+                        with st.container(border=True):
+                            st.markdown(f"**{block.title}**  \n`{block.code}`")
+                            for line in block.lines:
+                                st.write(f"- {line}")
+
+                    parts = recovery_breakdown(selected_row)
+                    if parts:
+                        st.caption(
+                            "Recoverable breakdown: "
+                            + " · ".join(
+                                f"{label} ${amount:,.2f}" for label, amount in parts
                             )
-                        else:
-                            st.write(f"- Filing Window: **{days_left} days remaining**")
+                            + (
+                                ". Each dollar is claimed once, so a weight-driven "
+                                "rate change is counted under the base rate."
+                                if "WEIGHT_INFLATION"
+                                in str(selected_row["anomaly_classification"])
+                                else "."
+                            )
+                        )
+                    st.caption(
+                        f"Scanned {selected_row['scan_timestamp']:%Y-%m-%d %H:%M} · "
+                        f"source feed `{selected_row['source_channel']}` · "
+                        f"status `{selected_row['dispute_status']}`"
+                    )
 
                     if (
                         selected_row["dispute_status"] != "DISPUTE_SENT"
@@ -943,9 +964,15 @@ with tab_reconciliation:
                                 "expected_cost": float(
                                     selected_row["expected_total_cost"]
                                 ),
+                                # The refund requested is the mart's recoverable
+                                # amount, not billed minus expected.
                                 "dollar_variance": float(
-                                    selected_row["dollar_variance"]
+                                    selected_row["recoverable_usd"]
                                 ),
+                                "anomaly_codes": str(
+                                    selected_row["anomaly_classification"]
+                                ),
+                                "evidence": evidence_lines(selected_row),
                             }
 
                             dispute_letter_text = ""
@@ -1003,7 +1030,7 @@ with tab_reconciliation:
                                     update_dispute_status_in_db(selected_row)
                                     st.session_state["audit_flash"] = (
                                         f"🎉 Dispute for {selected_trk} approved and submitted "
-                                        f"for ${float(selected_row['dollar_variance']):,.2f}."
+                                        f"for ${float(selected_row['recoverable_usd']):,.2f}."
                                     )
                                     st.toast(
                                         "Database record updated to DISPUTE_SENT.",

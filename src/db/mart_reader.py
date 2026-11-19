@@ -34,11 +34,49 @@ SELECT
     -- All-lines total, not billed_total_usd: only this reconciles as
     -- billed - expected = total_variance_usd on duplicate-billing rows.
     m.billed_total_all_lines_usd AS billed_total,
+    -- Billed minus expected. Not the claim amount: a late-delivery refund or an
+    -- unauthorized fee can leave this negative while money is still recoverable.
     m.total_variance_usd AS dollar_variance,
+    -- What the carrier owes back, each dollar attributed once (see the mart).
+    COALESCE(m.total_recoverable_usd, 0) AS recoverable_usd,
     m.anomaly_codes AS anomaly_classification,
     COALESCE(m.total_recoverable_usd, 0) > 0 AS is_eligible_for_dispute,
     CASE WHEN COALESCE(e.has_dispute_sent, FALSE) THEN 'DISPUTE_SENT'
-         ELSE 'PENDING_REVIEW' END AS dispute_status
+         ELSE 'PENDING_REVIEW' END AS dispute_status,
+    -- Evidence behind each reason code (rendered by src/agent/dispute_evidence.py)
+    m.billable_weight_expected_lbs,
+    m.dim_weight_lbs,
+    m.billable_weight_basis,
+    m.zone,
+    m.zone_billed,
+    m.weight_tier_min_lbs,
+    m.weight_tier_max_lbs,
+    m.service_level,
+    m.service_level_billed,
+    m.contract_base_rate_usd,
+    m.billed_base_rate_usd,
+    m.base_rate_variance_usd,
+    m.expected_fuel_surcharge_usd,
+    m.billed_fuel_surcharge_usd,
+    m.fuel_surcharge_variance_usd,
+    m.dest_address_type,
+    m.is_dest_address_cass_validated,
+    m.unauthorized_residential_fee_usd,
+    m.unauthorized_address_correction_fee_usd,
+    m.unauthorized_accessorial_usd,
+    m.unauthorized_accessorial_codes,
+    m.distinct_invoice_number_count,
+    m.all_invoice_numbers,
+    m.all_source_channels,
+    m.duplicate_billed_amount_usd,
+    m.guaranteed_delivery_timestamp,
+    m.actual_delivery_timestamp,
+    m.delivery_variance_hours,
+    m.gsr_refund_usd,
+    m.base_rate_recovery_usd,
+    m.fuel_recovery_usd,
+    m.accessorial_recovery_usd,
+    m.duplicate_recovery_usd
 FROM analytics_marts.fct_reconciliation_marts m
 LEFT JOIN (
     -- Pre-aggregated so repeated audit rows per tracking_id cannot fan out the mart.
@@ -46,8 +84,15 @@ LEFT JOIN (
     FROM source_enterprise.audit_flagged_exceptions
     GROUP BY tracking_id
 ) e ON m.tracking_id = e.tracking_id
-ORDER BY dollar_variance DESC;
+ORDER BY recoverable_usd DESC, tracking_id;
 """
+
+# Timestamps that move with the scan date when the snapshot is rebased.
+SNAPSHOT_TIME_COLUMNS = (
+    "scan_timestamp",
+    "guaranteed_delivery_timestamp",
+    "actual_delivery_timestamp",
+)
 
 
 def load_mart_from_db(engine) -> pd.DataFrame:
@@ -62,7 +107,7 @@ def load_mart_snapshot(
     df = pd.read_csv(
         path,
         dtype={"tracking_id": str, "package_id": str, "invoice_number": str},
-        parse_dates=["scan_timestamp"],
+        parse_dates=[c for c in SNAPSHOT_TIME_COLUMNS],
     )
     df["anomaly_classification"] = df["anomaly_classification"].fillna("")
     df["is_eligible_for_dispute"] = df["is_eligible_for_dispute"].astype(bool)
@@ -71,5 +116,7 @@ def load_mart_snapshot(
     if pd.notna(newest):
         today = today or pd.Timestamp.now(tz="UTC").date()
         target = pd.Timestamp(today) - pd.Timedelta(days=DEMO_NEWEST_SCAN_AGE_DAYS)
-        df["scan_timestamp"] += target - newest.normalize()
+        shift = target - newest.normalize()
+        for column in SNAPSHOT_TIME_COLUMNS:
+            df[column] += shift
     return df
