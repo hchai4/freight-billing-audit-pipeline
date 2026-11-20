@@ -8,6 +8,8 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
+import re
+
 import pandas as pd
 
 DEMO_SNAPSHOT_PATH = (
@@ -93,6 +95,33 @@ SNAPSHOT_TIME_COLUMNS = (
     "guaranteed_delivery_timestamp",
     "actual_delivery_timestamp",
 )
+
+
+def select_columns(query: str = MART_QUERY) -> list:
+    """Output column names of the mart query's top-level SELECT list.
+
+    The hosted demo has no database, so its snapshot must carry every column
+    the query returns; tests compare the two using this.
+    """
+    sql = re.sub(r"--[^\n]*", "", query)
+    body = re.split(r"\bFROM\b", sql, maxsplit=1, flags=re.IGNORECASE)[0]
+    body = re.sub(r"^\s*SELECT\b", "", body, flags=re.IGNORECASE)
+    items, depth, current = [], 0, ""
+    for char in body:
+        depth += (char == "(") - (char == ")")
+        if char == "," and depth == 0:
+            items.append(current)
+            current = ""
+        else:
+            current += char
+    items.append(current)
+    columns = []
+    for item in (part.strip() for part in items):
+        if not item:
+            continue
+        alias = re.search(r"\bAS\s+(\w+)\s*$", item, flags=re.IGNORECASE)
+        columns.append(alias.group(1) if alias else item.split(".")[-1].strip())
+    return columns
 
 
 def load_mart_from_db(engine) -> pd.DataFrame:

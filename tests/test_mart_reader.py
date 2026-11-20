@@ -5,7 +5,9 @@ import pandas as pd
 from src.db.mart_reader import (
     DEMO_NEWEST_SCAN_AGE_DAYS,
     DEMO_SNAPSHOT_PATH,
+    MART_QUERY,
     load_mart_snapshot,
+    select_columns,
 )
 
 APP_COLUMNS = {
@@ -73,3 +75,22 @@ def test_delivery_timestamps_move_with_the_scan_date():
     assert (
         shifted - sla["guaranteed_delivery_timestamp"] == pd.Timedelta(days=10)
     ).all()
+
+
+def test_select_columns_parses_aliases_and_plain_columns():
+    cols = select_columns(
+        "SELECT m.a, m.b AS bee, COALESCE(m.c, 0) AS cee,\n"
+        "  -- a comment, with a comma\n"
+        "  CASE WHEN x THEN 1 ELSE 2 END AS dee\nFROM t m"
+    )
+    assert cols == ["a", "bee", "cee", "dee"]
+
+
+def test_demo_snapshot_has_every_column_the_database_query_returns():
+    # The hosted demo reads the snapshot, so a column added to the query but not
+    # re-exported would break it. Re-run data/export_demo_snapshot.py to fix.
+    queried = select_columns(MART_QUERY)
+    assert len(queried) == len(set(queried))
+    snapshot = load_mart_snapshot()
+    missing = [column for column in queried if column not in snapshot.columns]
+    assert not missing, f"snapshot is missing {missing}; re-export it"
