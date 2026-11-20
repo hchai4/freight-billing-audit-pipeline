@@ -4,7 +4,7 @@
 
 Freight-audit system that cross-examines warehouse scale scans, UPS EDI 210 invoices, and unstructured portal/email PDFs. Overcharges are quantified in PostgreSQL by dbt, then surfaced in a Streamlit HITL workflow that drafts carrier dispute letters.
 
-**Live demo:** [Freight Billing Audit Pipeline](https://logistics-billing-anomaly-agent-rkngeowwvh6lkeep9gszt4.streamlit.app)  (see [Public demo](#public-demo-streamlit-community-cloud) for the limits)
+**Live demo:** [Freight Billing Audit Pipeline](https://logistics-billing-anomaly-agent-rkngeowwvh6lkeep9gszt4.streamlit.app) (see [Public demo](#public-demo-streamlit-community-cloud) for the limits)
 
 Invoice Ingestion and Defense Gate:
 <img width="1728" height="860" alt="Screenshot 2026-11-16 at 5 39 05 PM" src="https://github.com/user-attachments/assets/2f686ba4-9408-45ef-af81-9f37b3599788" />
@@ -234,7 +234,7 @@ Airflow runs dbt from the sibling repo, mounted at `/opt/dbt`. Clone that repo n
 
 ```bash
 cd ..
-git clone https://github.com/hchai4/freight-billing-audit-pipeline-dbt.git freight-billing-audit-pipeline-dbt
+git clone https://github.com/hchai4/freight-billing-audit-pipeline-dbt.git
 ```
 
 The host commands in the next section are the fallback when the Airflow service is not running.
@@ -259,7 +259,7 @@ Clone the sibling dbt repo and build the contract seeds plus the mart. Its profi
 
 ```bash
 cd ..
-git clone https://github.com/hchai4/freight-billing-audit-pipeline-dbt.git freight-billing-audit-pipeline-dbt
+git clone https://github.com/hchai4/freight-billing-audit-pipeline-dbt.git
 cd freight-billing-audit-pipeline-dbt
 python3 -m venv .venv
 source .venv/bin/activate

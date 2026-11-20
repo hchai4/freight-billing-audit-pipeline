@@ -1,5 +1,8 @@
+import hashlib
+import logging
 import os
 import sys
+import uuid
 from datetime import timedelta
 from pathlib import Path
 
@@ -12,18 +15,7 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
-from src.agent.llm_agent import InvoiceExtractionAgent
-from src.utils.pdf_extractor import extract_text_from_pdf
-from src.privacy.pii_masker import PIIMasker
-from src.db.db_writer import insert_extracted_invoice
-from src.agent.dispute_agent import DisputeAgent, DisputeRequest
-
-load_dotenv()
-
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/logistics_db"
-)
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------
 # Page Configuration
@@ -33,6 +25,82 @@ st.set_page_config(
     page_icon="📦",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+# ---------------------------------------------------------
+# Configuration & Secrets
+# ---------------------------------------------------------
+load_dotenv()
+
+# Streamlit Community Cloud supplies configuration through st.secrets, while the
+# agents read os.environ at import time. Copy the keys across before importing
+# them; values are never rendered or logged.
+CONFIG_KEYS = (
+    "OPENAI_API_KEY",
+    "DATABASE_URL",
+    "API_BASE_URL",
+    "DEMO_MODE",
+    "DEMO_SESSION_DAILY_LIMIT",
+    "DEMO_IP_DAILY_LIMIT",
+    "DEMO_GLOBAL_DAILY_LIMIT",
+    "DEMO_MAX_INPUT_CHARS",
+)
+try:
+    for _key in CONFIG_KEYS:
+        if _key in st.secrets and not os.getenv(_key):
+            os.environ[_key] = str(st.secrets[_key])
+except Exception:
+    # No secrets file (local runs configured through .env).
+    pass
+
+_openai_key = os.getenv("OPENAI_API_KEY", "")
+if not _openai_key or _openai_key.startswith("your_"):
+    st.error(
+        "OPENAI_API_KEY is not configured. Set it in `.env` for local runs or in "
+        "the app's Secrets on Streamlit Community Cloud."
+    )
+    st.stop()
+
+from src.agent.llm_agent import InvoiceExtractionAgent
+from src.utils.pdf_extractor import extract_text_from_pdf
+from src.privacy.pii_masker import PIIMasker
+from src.db.db_writer import insert_extracted_invoice
+from src.db.mart_reader import load_mart_from_db, load_mart_snapshot
+from src.agent.dispute_agent import DisputeAgent, DisputeRequest
+from src.agent.dispute_evidence import (
+    build_evidence,
+    evidence_lines,
+    recovery_breakdown,
+)
+from src.demo.usage_guard import UsageGuard, UsageLimits
+
+# Demo mode serves a bundled mart snapshot, keeps writes in the visitor's own
+# session, and meters AI calls. It is the default whenever no warehouse is
+# configured, so a hosted deployment is rate-limited unless it opts out.
+_demo_flag = os.getenv("DEMO_MODE", "").strip().lower()
+if _demo_flag:
+    DEMO_MODE = _demo_flag in ("1", "true", "yes", "on")
+else:
+    DEMO_MODE = not os.getenv("DATABASE_URL")
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/logistics_db"
+)
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except ValueError:
+        return default
+
+
+USAGE_LIMITS = UsageLimits(
+    session_daily=_env_int("DEMO_SESSION_DAILY_LIMIT", UsageLimits.session_daily),
+    ip_daily=_env_int("DEMO_IP_DAILY_LIMIT", UsageLimits.ip_daily),
+    global_daily=_env_int("DEMO_GLOBAL_DAILY_LIMIT", UsageLimits.global_daily),
+    max_input_chars=_env_int("DEMO_MAX_INPUT_CHARS", UsageLimits.max_input_chars),
 )
 
 # ---------------------------------------------------------
@@ -105,42 +173,55 @@ AUDIT_COLUMNS = (
 )
 
 
+@st.cache_resource
+def get_usage_guard() -> UsageGuard:
+    """One guard per server process, shared by every visitor."""
+    return UsageGuard(USAGE_LIMITS)
+
+
+def _visitor_keys() -> tuple:
+    """Session id plus a hashed client IP (None when the IP is unavailable)."""
+    if "demo_session_id" not in st.session_state:
+        st.session_state["demo_session_id"] = uuid.uuid4().hex
+    ip = None
+    try:
+        forwarded = st.context.headers.get("X-Forwarded-For")
+        ip = forwarded.split(",")[0].strip() if forwarded else st.context.ip_address
+    except Exception:
+        pass
+    ip_key = hashlib.sha256(ip.encode()).hexdigest()[:16] if ip else None
+    return st.session_state["demo_session_id"], ip_key
+
+
+def reserve_ai_call() -> bool:
+    """Charges one AI call against the visitor's demo quota, warning if refused."""
+    if not DEMO_MODE:
+        return True
+    refusal = get_usage_guard().try_acquire(*_visitor_keys())
+    if refusal:
+        st.warning(f"⏳ {refusal}")
+        return False
+    return True
+
+
 def load_reconciliation_mart() -> pd.DataFrame:
-    """Queries fct_reconciliation_marts joined with exception audit statuses."""
-    query = """
-    SELECT
-        m.tracking_id,
-        m.package_id,
-        m.primary_invoice_number AS invoice_number,
-        m.carrier_code AS carrier_name,
-        m.primary_source_channel AS source_channel,
-        m.scan_timestamp,
-        m.actual_scale_weight_lbs AS actual_scale_weight,
-        m.billed_weight_lbs AS billed_weight,
-        m.weight_variance_lbs,
-        m.expected_total_cost_usd AS expected_total_cost,
-        -- All-lines total, not billed_total_usd: only this reconciles as
-        -- billed - expected = total_variance_usd on duplicate-billing rows.
-        m.billed_total_all_lines_usd AS billed_total,
-        m.total_variance_usd AS dollar_variance,
-        m.anomaly_codes AS anomaly_classification,
-        COALESCE(m.total_recoverable_usd, 0) > 0 AS is_eligible_for_dispute,
-        CASE WHEN COALESCE(e.has_dispute_sent, FALSE) THEN 'DISPUTE_SENT'
-             ELSE 'PENDING_REVIEW' END AS dispute_status
-    FROM analytics_marts.fct_reconciliation_marts m
-    LEFT JOIN (
-        -- Pre-aggregated so repeated audit rows per tracking_id cannot fan out the mart.
-        SELECT tracking_id, bool_or(dispute_status = 'DISPUTE_SENT') AS has_dispute_sent
-        FROM source_enterprise.audit_flagged_exceptions
-        GROUP BY tracking_id
-    ) e ON m.tracking_id = e.tracking_id
-    ORDER BY dollar_variance DESC;
-    """
-    return pd.read_sql(query, con=get_engine())
+    """Loads the reconciliation mart with dispute statuses applied."""
+    if not DEMO_MODE:
+        return load_mart_from_db(get_engine())
+    df = load_mart_snapshot()
+    sent = st.session_state.get("demo_disputes_sent", set())
+    df.loc[df["tracking_id"].isin(sent), "dispute_status"] = "DISPUTE_SENT"
+    return df
 
 
 def update_dispute_status_in_db(row_data: dict):
     """Updates or records dispute status as DISPUTE_SENT in PostgreSQL."""
+    if DEMO_MODE:
+        # Visitors share no warehouse: a filed dispute lives in their session only.
+        st.session_state.setdefault("demo_disputes_sent", set()).add(
+            str(row_data["tracking_id"])
+        )
+        return
     update_sql = text(
         """
     UPDATE source_enterprise.audit_flagged_exceptions
@@ -175,22 +256,31 @@ def update_dispute_status_in_db(row_data: dict):
 with st.sidebar:
     st.header("⚙️ System Status")
 
-    try:
-        with get_engine().connect() as conn:
-            conn.execute(text("SELECT 1"))
-        st.success("🟢 PostgreSQL: Connected")
-    except Exception:
-        st.error("🔴 PostgreSQL: Unreachable")
+    # Filled at the end of the run so it reflects calls made during this run.
+    quota_slot = st.empty()
 
-    # Check FastAPI Backend Health
-    try:
-        health_resp = requests.get(f"{API_BASE_URL}/health", timeout=1.0)
-        if health_resp.status_code == 200:
-            st.success("🟢 FastAPI Backend: Online")
-        else:
-            st.warning("🟡 FastAPI Backend: Degraded")
-    except Exception:
-        st.info("ℹ️ FastAPI Backend: Offline (Using Local Fallback)")
+    if DEMO_MODE:
+        st.info(
+            "🧪 **Public demo.** Tab 2 shows a snapshot exported from the dbt "
+            "mart, and disputes you file stay in your own browser session."
+        )
+    else:
+        try:
+            with get_engine().connect() as conn:
+                conn.execute(text("SELECT 1"))
+            st.success("🟢 PostgreSQL: Connected")
+        except Exception:
+            st.error("🔴 PostgreSQL: Unreachable")
+
+        # Check FastAPI Backend Health
+        try:
+            health_resp = requests.get(f"{API_BASE_URL}/health", timeout=1.0)
+            if health_resp.status_code == 200:
+                st.success("🟢 FastAPI Backend: Online")
+            else:
+                st.warning("🟡 FastAPI Backend: Degraded")
+        except Exception:
+            st.info("ℹ️ FastAPI Backend: Offline (Using Local Fallback)")
 
     st.divider()
     st.markdown("**Enterprise Architecture Stack:**")
@@ -270,7 +360,13 @@ with tab_ingestion:
     ):
         if invoice_text is None or not invoice_text.strip():
             st.warning("⚠️ Please provide invoice text to analyze.")
-        else:
+        elif DEMO_MODE and len(invoice_text) > USAGE_LIMITS.max_input_chars:
+            st.warning(
+                f"⚠️ The demo accepts invoices up to "
+                f"{USAGE_LIMITS.max_input_chars:,} characters "
+                f"(this one is {len(invoice_text):,})."
+            )
+        elif reserve_ai_call():
             with st.spinner(
                 "Extracting Pydantic Schema & Running Deterministic Math Verification..."
             ):
@@ -282,7 +378,16 @@ with tab_ingestion:
                     st.session_state["latest_math_report"] = math_report
                     st.session_state["latest_pii_stats"] = pii_stats
                 except Exception as e:
-                    st.error(f"Extraction failed: {str(e)}")
+                    if DEMO_MODE:
+                        # Provider errors can echo request details; keep them in
+                        # the server log rather than on a public page.
+                        logger.exception("Invoice extraction failed")
+                        st.error(
+                            "Extraction failed. Check that the text is a carrier "
+                            "invoice, or load one of the samples above."
+                        )
+                    else:
+                        st.error(f"Extraction failed: {str(e)}")
 
     # Render extraction results if available
     if "latest_extraction" in st.session_state:
@@ -345,6 +450,12 @@ with tab_ingestion:
                 "📥 Save & Ingest to Database",
                 type="secondary",
                 use_container_width=True,
+                disabled=DEMO_MODE,
+                help=(
+                    "Disabled in the public demo, which has no warehouse to write to."
+                    if DEMO_MODE
+                    else None
+                ),
             ):
                 try:
                     rows_inserted = insert_extracted_invoice(
@@ -435,11 +546,14 @@ with tab_reconciliation:
             # -------------------------------------------------
             # Executive KPI banner
             # -------------------------------------------------
-            overcharges = pd.DataFrame(
-                audit_df[audit_df["dollar_variance"] > 0], copy=False
+            # Leakage is what the mart says is recoverable. Billed-minus-expected
+            # is not a claim: a late-delivery refund or an unauthorized fee can
+            # leave it negative while money is still owed back.
+            recoverable = pd.DataFrame(
+                audit_df[audit_df["recoverable_usd"] > 0], copy=False
             )
-            total_leakage = pd.Series(overcharges["dollar_variance"]).sum()
-            overcharge_count = len(overcharges)
+            total_leakage = pd.Series(recoverable["recoverable_usd"]).sum()
+            overcharge_count = len(recoverable)
 
             critical_open = audit_df[
                 (audit_df["is_eligible_for_dispute"])
@@ -451,14 +565,14 @@ with tab_reconciliation:
             disputes_sent = pd.DataFrame(
                 audit_df[audit_df["dispute_status"] == "DISPUTE_SENT"], copy=False
             )
-            claimed_total = pd.Series(disputes_sent["dollar_variance"]).sum()
+            claimed_total = pd.Series(disputes_sent["recoverable_usd"]).sum()
 
             with st.container(horizontal=True):
                 st.metric("Audited shipments", f"{len(audit_df):,}", border=True)
                 st.metric(
                     "Identified leakage",
                     f"${total_leakage:,.2f}",
-                    delta=f"{overcharge_count:,} overcharges",
+                    delta=f"{overcharge_count:,} recoverable claims",
                     delta_color="off",
                     delta_arrow="off",
                     border=True,
@@ -617,7 +731,7 @@ with tab_reconciliation:
                 )
                 high_confidence = pd.DataFrame(
                     eligible_unsent[
-                        eligible_unsent["dollar_variance"] >= HIGH_CONFIDENCE_CLAIM_USD
+                        eligible_unsent["recoverable_usd"] >= HIGH_CONFIDENCE_CLAIM_USD
                     ],
                     copy=True,
                 )
@@ -627,7 +741,7 @@ with tab_reconciliation:
                     portal_columns = {
                         "invoice_number": "Carrier_Invoice_Number",
                         "tracking_id": "Disputed_Tracking_ID",
-                        "dollar_variance": "Claim_Refund_Amount",
+                        "recoverable_usd": "Claim_Refund_Amount",
                         "anomaly_classification": "Dispute_Reason_Code",
                     }
                     portal_batch = eligible_unsent.rename(columns=portal_columns)[
@@ -638,7 +752,6 @@ with tab_reconciliation:
                             "billed_total",
                             "expected_total_cost",
                             "Claim_Refund_Amount",
-                            "weight_variance_lbs",
                             "Dispute_Reason_Code",
                         ]
                     ]
@@ -666,7 +779,7 @@ with tab_reconciliation:
                         for claim in high_confidence.to_dict("records"):
                             try:
                                 update_dispute_status_in_db(claim)
-                                claimed += float(claim["dollar_variance"])
+                                claimed += float(claim["recoverable_usd"])
                             except Exception as exc:
                                 failures.append(f"{claim['tracking_id']}: {exc}")
 
@@ -693,30 +806,32 @@ with tab_reconciliation:
                     "invoice_number",
                     "source_channel",
                     "carrier_name",
-                    "actual_scale_weight",
-                    "billed_weight",
-                    "weight_variance_lbs",
+                    "anomaly_classification",
+                    "recoverable_usd",
                     "expected_total_cost",
                     "billed_total",
                     "dollar_variance",
-                    "anomaly_classification",
                     "aging_urgency",
                     "dispute_status",
                 ]
                 usd = st.column_config.NumberColumn(format="$%.2f")
-                lbs = st.column_config.NumberColumn(format="%.2f")
                 st.dataframe(
                     filtered_df[display_cols],
                     width="stretch",
                     height=300,
                     hide_index=True,
                     column_config={
-                        "actual_scale_weight": lbs,
-                        "billed_weight": lbs,
-                        "weight_variance_lbs": lbs,
+                        "anomaly_classification": "Reason codes",
+                        "recoverable_usd": st.column_config.NumberColumn(
+                            "Recoverable", format="$%.2f"
+                        ),
                         "expected_total_cost": usd,
                         "billed_total": usd,
-                        "dollar_variance": usd,
+                        "dollar_variance": st.column_config.NumberColumn(
+                            "Billed − expected",
+                            format="$%.2f",
+                            help="Not the claim amount. See Recoverable.",
+                        ),
                     },
                 )
 
@@ -752,8 +867,8 @@ with tab_reconciliation:
                         "Select flagged tracking number for review",
                         options=list(disputable_rows),
                         format_func=lambda x: (
-                            f"{x} (Overcharge: +${disputable_rows[x]['dollar_variance']:.2f}"
-                            f" | {disputable_rows[x]['anomaly_classification']})"
+                            f"{x} (Recoverable: ${disputable_rows[x]['recoverable_usd']:.2f}"
+                            f" | {disputable_rows[x]['anomaly_classification'] or 'FUEL SURCHARGE'})"
                         ),
                     )
 
@@ -762,46 +877,58 @@ with tab_reconciliation:
 
                     # Audit Evidence Comparison Card
                     st.markdown("#### 🔍 Audit Evidence Ground Truth")
-                    e_col1, e_col2, e_col3 = st.columns(3)
-                    with e_col1:
-                        st.markdown("**Physical Warehouse Reality (WMS):**")
-                        st.write(
-                            f"- Scale Weight: **{selected_row['actual_scale_weight']} lbs**"
+                    if selected_row["dispute_status"] == "DISPUTE_SENT":
+                        window_text = "Claim already filed"
+                    elif days_left < 0:
+                        window_text = f"Expired {abs(days_left)} days ago"
+                    else:
+                        window_text = f"{days_left} days left"
+
+                    with st.container(horizontal=True):
+                        st.metric(
+                            "Recoverable",
+                            f"${selected_row['recoverable_usd']:,.2f}",
+                            border=True,
                         )
-                        st.write(
-                            f"- Scan Timestamp: `{selected_row['scan_timestamp']}`"
+                        st.metric(
+                            "Carrier billed",
+                            f"${selected_row['billed_total']:,.2f}",
+                            border=True,
                         )
-                        st.write(
-                            f"- Expected Cost: **${selected_row['expected_total_cost']:.2f}**"
+                        st.metric(
+                            "Owed under contract",
+                            f"${selected_row['expected_total_cost']:,.2f}",
+                            border=True,
                         )
-                    with e_col2:
-                        st.markdown("**Carrier Invoiced Reality:**")
-                        st.write(
-                            f"- Billed Weight: **{selected_row['billed_weight']} lbs**"
-                        )
-                        st.write(f"- Source Feed: `{selected_row['source_channel']}`")
-                        st.write(
-                            f"- Billed Amount: **${selected_row['billed_total']:.2f}**"
-                        )
-                    with e_col3:
-                        st.markdown("**Audit Findings & Filing Window:**")
-                        st.write(
-                            f"- Weight Delta: **+{selected_row['weight_variance_lbs']} lbs**"
-                        )
-                        st.write(
-                            f"- Net Overcharge: **+${selected_row['dollar_variance']:.2f}**"
-                        )
-                        st.write(
-                            f"- Current Status: `{selected_row['dispute_status']}`"
-                        )
-                        if selected_row["dispute_status"] == "DISPUTE_SENT":
-                            st.write("- Filing Window: **Claim already filed**")
-                        elif days_left < 0:
-                            st.write(
-                                f"- Filing Window: **Expired {abs(days_left)} days ago**"
+                        st.metric("Filing window", window_text, border=True)
+
+                    # One panel per reason code, each citing its own evidence.
+                    for block in build_evidence(selected_row):
+                        with st.container(border=True):
+                            st.markdown(f"**{block.title}**  \n`{block.code}`")
+                            for line in block.lines:
+                                st.write(f"- {line}")
+
+                    parts = recovery_breakdown(selected_row)
+                    if parts:
+                        st.caption(
+                            "Recoverable breakdown: "
+                            + " · ".join(
+                                f"{label} ${amount:,.2f}" for label, amount in parts
                             )
-                        else:
-                            st.write(f"- Filing Window: **{days_left} days remaining**")
+                            + (
+                                ". Each dollar is claimed once, so a weight-driven "
+                                "rate change is counted under the base rate."
+                                if "WEIGHT_INFLATION"
+                                in str(selected_row["anomaly_classification"])
+                                else "."
+                            )
+                        )
+                    st.caption(
+                        f"Scanned {selected_row['scan_timestamp']:%Y-%m-%d %H:%M} · "
+                        f"source feed `{selected_row['source_channel']}` · "
+                        f"status `{selected_row['dispute_status']}`"
+                    )
 
                     if (
                         selected_row["dispute_status"] != "DISPUTE_SENT"
@@ -815,8 +942,12 @@ with tab_reconciliation:
 
                     # Action: Generate AI Dispute Letter
                     st.write("")
-                    if st.button(
-                        "📝 Generate Individual Formal Dispute Letter", type="primary"
+                    if (
+                        st.button(
+                            "📝 Generate Individual Formal Dispute Letter",
+                            type="primary",
+                        )
+                        and reserve_ai_call()
                     ):
                         with st.spinner(
                             "Calling AI Dispute Agent to compile evidence-backed claim letter..."
@@ -833,13 +964,22 @@ with tab_reconciliation:
                                 "expected_cost": float(
                                     selected_row["expected_total_cost"]
                                 ),
+                                # The refund requested is the mart's recoverable
+                                # amount, not billed minus expected.
                                 "dollar_variance": float(
-                                    selected_row["dollar_variance"]
+                                    selected_row["recoverable_usd"]
                                 ),
+                                "anomaly_codes": str(
+                                    selected_row["anomaly_classification"]
+                                ),
+                                "evidence": evidence_lines(selected_row),
                             }
 
                             dispute_letter_text = ""
                             try:
+                                if DEMO_MODE:
+                                    # The hosted demo runs no FastAPI service.
+                                    raise RuntimeError("in-process only")
                                 # 1. Attempt calling the live FastAPI REST endpoint
                                 resp = requests.post(
                                     f"{API_BASE_URL}/api/generate-dispute",
@@ -890,7 +1030,7 @@ with tab_reconciliation:
                                     update_dispute_status_in_db(selected_row)
                                     st.session_state["audit_flash"] = (
                                         f"🎉 Dispute for {selected_trk} approved and submitted "
-                                        f"for ${float(selected_row['dollar_variance']):,.2f}."
+                                        f"for ${float(selected_row['recoverable_usd']):,.2f}."
                                     )
                                     st.toast(
                                         "Database record updated to DISPUTE_SENT.",
@@ -909,7 +1049,20 @@ with tab_reconciliation:
                             )
 
     except Exception as e:
-        st.error(f"Failed to load reconciliation mart: {e}")
-        st.info(
-            "💡 Ensure PostgreSQL is running on port 5432 and you have executed `dbt run` to build `analytics_marts.fct_reconciliation_marts`."
-        )
+        if DEMO_MODE:
+            logger.exception("Audit tab failed")
+            st.error("Something went wrong in the audit tab. Please try again.")
+        else:
+            st.error(f"Failed to load reconciliation mart: {e}")
+            st.info(
+                "💡 Ensure PostgreSQL is running on port 5432 and you have executed `dbt run` to build `analytics_marts.fct_reconciliation_marts`."
+            )
+
+if DEMO_MODE:
+    calls_left = get_usage_guard().remaining(*_visitor_keys())
+    quota_slot.metric(
+        "AI calls left today",
+        f"{calls_left} / {USAGE_LIMITS.session_daily}",
+        help="Each extraction or dispute letter uses one call. Resets at 00:00 UTC.",
+        border=True,
+    )

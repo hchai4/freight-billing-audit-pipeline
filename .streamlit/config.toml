@@ -1,0 +1,11 @@
+[server]
+# Invoices are a few KB; a small cap keeps public uploads cheap to parse.
+maxUploadSize = 2
+
+[client]
+# Never render exception text or tracebacks to visitors; details go to the log.
+showErrorDetails = "none"
+toolbarMode = "viewer"
+
+[browser]
+gatherUsageStats = false
