@@ -18,7 +18,7 @@
 | Postgres | 16.15，单机容器，`shared_buffers=128MB`，`work_mem=4MB` |
 | dbt | dbt-core 1.12.4，postgres adapter 1.11.0，4 线程 |
 | 数据 | 困难模式，seed 42，日期 2026-01-26 到 2026-04-19 |
-| 增量方式 | `stg_wms_scans`、`stg_edi_invoices` 按 id 高水位线 `delete+insert` |
+| 增量方式 | `stg_wms_scans`、`stg_edi_invoices` 按 id 高水位线 `delete+insert`。测试时为常开；合并时改成默认关闭，用 `--vars '{incremental_staging: true}'` 打开 |
 
 ## 耗时与内存
 
