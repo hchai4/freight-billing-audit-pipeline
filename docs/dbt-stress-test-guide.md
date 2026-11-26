@@ -10,7 +10,7 @@
 | 数据 | `data/stress_output/dbt/`：困难模式，日期落在 2026-01-26 到 2026-04-19，和合约种子的有效期对得上。 |
 | 已装载 | 每张表前 90%（各 1,800,000 行）。剩下 10% 留作"增量"。 |
 | 标签 | `stress_eval.defect_labels`（含全部 2M 行的标签）。 |
-| dbt 仓库 | 一个文件都没改。 |
+| dbt 仓库 | 暂存层增量已合并进 `master`，默认关闭（见第 3 步）。 |
 
 下面两个目录用简称：
 
@@ -21,7 +21,7 @@
 
 ## 0. 先知道的三件事
 
-1. **dbt 仓库里目前没有任何增量模型。** 所有模型都是 view，marts 是 table。所以"跑一次增量"之前，要先把模型改成增量（第 3 步）。
+1. **增量默认关闭。** 默认情况下暂存层是 view，marts 是 table。压测时每次 `dbt run` 都要打开开关（第 3 步），包括第一次全量。
 2. **`DBT/.venv/bin/dbt` 的启动脚本指向旧路径，直接运行会报错。** 一律用 `python -m dbt.cli.main` 代替 `dbt`。
 3. **dbt 自己的审计结论不能用来算召回率。** marts 的异常是另一套业务规则，定义和注入的缺陷标签不同，生成器的燃油费率表也和种子不同。召回率统一用第 6 步的 SQL 来算。实测结果见 [dbt-stress-test-results.md](dbt-stress-test-results.md)。
 
@@ -46,49 +46,17 @@ dbt 的输出 schema 是 `analytics_staging`、`analytics_intermediate`、`analy
 dbt seed
 ```
 
-## 3. 把两个大表改成增量（只改 2 个文件）
+## 3. 打开暂存层增量
+
+两个大表的增量模式已经写好（`stg_wms_scans`、`stg_edi_invoices`），默认关闭。压测时在命令后面加：
+
+```bash
+--vars '{incremental_staging: true}'
+```
 
 增量的做法是"高水位线"：`package_id` 和 `edi_record_id` 是补零递增的，所以新行就是 id 大于已有最大 id 的行。
 
-**`models/staging/stg_wms_scans.sql`**，把开头改成：
-
-```sql
-{{ config(
-    materialized='incremental',
-    unique_key='package_id',
-    incremental_strategy='delete+insert'
-) }}
-
-with source as (
-
-    select * from {{ source('source_enterprise', 'raw_wms_package_scans') }}
-    {% if is_incremental() %}
-    where package_id > (select max(package_id) from {{ this }})
-    {% endif %}
-
-),
-```
-
-下面的 `cleaned` 部分一行不用动。
-
-**`models/staging/stg_edi_invoices.sql`**，同样改法：
-
-```sql
-{{ config(
-    materialized='incremental',
-    unique_key='invoice_line_id',
-    incremental_strategy='delete+insert'
-) }}
-
-with source as (
-
-    select * from {{ source('source_enterprise', 'raw_edi_ups_invoices') }}
-    {% if is_incremental() %}
-    where edi_record_id > (select max(invoice_line_id) from {{ this }})
-    {% endif %}
-
-),
-```
+默认关闭是因为本地示例数据会删表重建、id 不变，开着增量会静默跳过新数据。**不要对真实库（5432）打开这个开关。** 某次运行漏加开关，两个模型会变回 view，下一次带开关的运行会重新全量构建，那次的耗时不能当增量记录。
 
 要知道的限制：
 
@@ -102,7 +70,7 @@ with source as (
 
 ```bash
 cd $DBT   # 同上，别忘了 export 和 alias
-/usr/bin/time -l .venv/bin/python -m dbt.cli.main run 2>&1 | tee /tmp/dbt_full.log
+/usr/bin/time -l .venv/bin/python -m dbt.cli.main run --vars '{incremental_staging: true}' 2>&1 | tee /tmp/dbt_full.log
 cp target/run_results.json /tmp/run_results_full.json
 ```
 
@@ -143,14 +111,14 @@ cd ~/Desktop/DBTProject/freight-billing-audit-pipeline
 然后在 dbt 里：
 
 ```bash
-/usr/bin/time -l .venv/bin/python -m dbt.cli.main run 2>&1 | tee /tmp/dbt_incr.log
+/usr/bin/time -l .venv/bin/python -m dbt.cli.main run --vars '{incremental_staging: true}' 2>&1 | tee /tmp/dbt_incr.log
 cp target/run_results.json /tmp/run_results_incr.json
 ```
 
 公平对比再跑一次**同样 200 万行**的全量重建：
 
 ```bash
-/usr/bin/time -l .venv/bin/python -m dbt.cli.main run --full-refresh 2>&1 | tee /tmp/dbt_full2.log
+/usr/bin/time -l .venv/bin/python -m dbt.cli.main run --full-refresh --vars '{incremental_staging: true}' 2>&1 | tee /tmp/dbt_full2.log
 ```
 
 结果这样填：
