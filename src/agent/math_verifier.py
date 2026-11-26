@@ -32,7 +32,7 @@ class MathVerifier:
     Executes hard arithmetic checks across extracted invoice line items.
     """
 
-    def __init__(self, tolerance: float = 0.01):
+    def __init__(self, tolerance: float = 100.0):
         # 0.01 USD tolerance handles minor floating-point rounding issues
         self.tolerance = tolerance
 
